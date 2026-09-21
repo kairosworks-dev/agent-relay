@@ -1,0 +1,13 @@
+# ClusterIP (the default type): reachable inside the cluster at the DNS
+# name "postgres" -- this Service's own metadata.name -- and nowhere else.
+# This is the hostname the app's DATABASE_URL uses.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

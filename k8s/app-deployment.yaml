@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-relay
+  labels:
+    app: agent-relay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-relay
+  template:
+    metadata:
+      labels:
+        app: agent-relay
+    spec:
+      # Kubernetes has no Compose-style depends_on/health-gated startup
+      # ordering. Rather than let the app crash-loop on a DB connection
+      # error while Postgres is still starting, block pod startup here
+      # until Postgres actually accepts connections.
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - until pg_isready -h postgres -p 5432 -U agent_relay; do echo waiting for postgres; sleep 1; done
+      containers:
+        - name: agent-relay
+          image: agent-relay:local
+          # Never, not the default IfNotPresent: this image only exists
+          # because `kind load docker-image` put it on the node directly.
+          # Never fails loudly (ImagePullBackOff) if that step was skipped,
+          # instead of quietly trying (and failing) to pull from a registry.
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agent-relay-secrets
+                  key: DATABASE_URL
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10

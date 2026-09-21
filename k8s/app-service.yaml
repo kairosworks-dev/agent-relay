@@ -1,0 +1,12 @@
+# ClusterIP: not published outside the cluster. Reached via
+# `kubectl port-forward svc/agent-relay 8000:8000`, per Q5.
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-relay
+spec:
+  selector:
+    app: agent-relay
+  ports:
+    - port: 8000
+      targetPort: 8000
