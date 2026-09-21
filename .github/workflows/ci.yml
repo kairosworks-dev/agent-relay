@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # A throwaway Postgres for this job only -- never the persistent one the
+    # kind cluster runs. test_agent_relay.py drops and recreates every table,
+    # so it must never point at a database with data anyone cares about.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: agent_relay
+          POSTGRES_PASSWORD: agent_relay_dev_only
+          POSTGRES_DB: agent_relay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_relay -d agent_relay"
+          --health-interval 2s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql+psycopg://agent_relay:agent_relay_dev_only@localhost:5432/agent_relay
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # This is the Q4 concurrency proof (16-thread concurrent claims, lease
+      # expiry before/after recovery) run against real PostgreSQL, not SQLite.
+      - name: Run starter test suite against PostgreSQL
+        run: uv run pytest test_agent_relay.py -v
+
+      - name: Run Q2 acceptance-scenario integration test against PostgreSQL
+        run: uv run pytest test_q2_integration.py -v
+
+  deploy:
+    # Only runs if `test` succeeded -- this IS the "stop on failed tests"
+    # gate; no separate if-check needed.
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kind and kubectl
+        run: |
+          arch="$(dpkg --print-architecture)"
+          curl -Lo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-${arch}"
+          chmod +x /usr/local/bin/kind
+          curl -Lo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.36.1/bin/linux/${arch}/kubectl"
+          chmod +x /usr/local/bin/kubectl
+
+      - name: Ensure the kind cluster exists
+        run: kind get clusters | grep -qx agent-relay || kind create cluster --name agent-relay
+
+      - name: Point kubectl at it
+        run: kind export kubeconfig --name agent-relay
+
+      # Unique per run so kind always has a fresh image to load and the
+      # Deployment always has a new tag to roll out to (a static tag like
+      # ":local" wouldn't trigger a rollout on a re-apply -- the pod spec
+      # wouldn't have changed).
+      - name: Compute a unique image tag
+        id: vars
+        run: echo "tag=$(date +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        run: docker build -t "agent-relay:${{ steps.vars.outputs.tag }}" .
+
+      - name: Load image into kind
+        run: kind load docker-image "agent-relay:${{ steps.vars.outputs.tag }}" --name agent-relay
+
+      # Idempotent: re-applies Postgres/Services/PVC/Secret unchanged, and
+      # the app Deployment's non-image fields (probes, initContainer, etc).
+      - name: Apply manifests
+        run: kubectl apply -f k8s/
+
+      - name: Deploy the new image and wait for rollout
+        run: |
+          kubectl set image deployment/agent-relay agent-relay="agent-relay:${{ steps.vars.outputs.tag }}"
+          kubectl rollout status deployment/agent-relay --timeout=120s

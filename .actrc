@@ -1,0 +1,3 @@
+# Runner image with a Docker CLI preinstalled -- act's default minimal
+# image doesn't have one, and the deploy job needs `docker build`.
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
