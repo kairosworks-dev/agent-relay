@@ -1,0 +1,15 @@
+.venv
+.git
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+*-credentials.json
+homework.md
+README.md
+SPEC.md
+test_agent_relay.py
+test_q2_integration.py
