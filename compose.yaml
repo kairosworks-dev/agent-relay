@@ -1,0 +1,43 @@
+# Local dev/homework stack: Agent Relay + PostgreSQL.
+#
+# POSTGRES_PASSWORD below is a fixed local-only default -- this Postgres is
+# reachable only on the Compose-internal network (postgres:5432), never
+# published past the app container. It is a convenience default, not a
+# secret; override it with a real one via POSTGRES_PASSWORD in your shell
+# or a .env file (gitignored) for anything beyond this homework.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agent_relay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agent_relay_dev_only}
+      POSTGRES_DB: agent_relay
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_relay -d agent_relay"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    # Not required by the app (it reaches postgres by service name on the
+    # Compose network), published only so `psql`/a GUI client on the host
+    # can inspect the data directly -- see Q4 verification.
+    ports:
+      - "5432:5432"
+
+  app:
+    build: .
+    image: agent-relay:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Service name "postgres" resolves via Compose's internal DNS -- the
+      # app never talks to localhost or a host-mapped port.
+      DATABASE_URL: postgresql+psycopg://agent_relay:${POSTGRES_PASSWORD:-agent_relay_dev_only}@postgres:5432/agent_relay
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:

@@ -1,9 +1,13 @@
 """Persistence operations for Agent Relay.
 
 Routes and the worker call these functions instead of issuing SQL directly.
-Claim, heartbeat, terminal submission, and recovery each use the same atomic
-SQLite transaction seam, which is the one area students will later replace by
-PostgreSQL row-locking operations.
+Claim, heartbeat, terminal submission, and recovery each open through
+``immediate_transaction()`` in database.py. On SQLite that is one global
+``BEGIN IMMEDIATE`` writer lock; on PostgreSQL (``USE_ROW_LOCKS``) it is a
+plain transaction and these functions take row-level ``.with_for_update()``
+locks themselves instead, in a consistent Task-then-Attempt order so that a
+heartbeat racing a recovery pass at lease expiry waits rather than
+deadlocks.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import (
@@ -26,6 +31,7 @@ from database import (
     LEASE_SECONDS,
     MAX_ATTEMPTS,
     Task,
+    USE_ROW_LOCKS,
     as_db_time,
     db_session,
     db_time,
@@ -104,8 +110,12 @@ def list_agents(limit: int, cursor: tuple[datetime, str] | None) -> tuple[list[A
 
 
 def create_task(sender_id: str, recipient_id: str, input_text: str, idempotency_key: str | None) -> dict[str, str]:
-    # Serializing task creation makes the sender-scoped idempotency check and
-    # unique constraint one operation even when two API processes race.
+    # On SQLite, BEGIN IMMEDIATE already serializes every writer, so the
+    # existence check and the insert below can never race. On PostgreSQL two
+    # requests with the same idempotency key can both pass the check before
+    # either commits; the unique constraint then rejects the second insert,
+    # which the except IntegrityError branch turns back into the same
+    # idempotent response instead of a raw 500.
     with immediate_transaction() as db:
         recipient = db.get(Agent, recipient_id)
         if recipient is None:
@@ -136,20 +146,51 @@ def create_task(sender_id: str, recipient_id: str, input_text: str, idempotency_
             finished_at=None,
         )
         db.add(task)
-        db.flush()
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            if idempotency_key is None:
+                raise
+            existing = db.scalar(
+                select(Task).where(Task.sender_id == sender_id, Task.idempotency_key == idempotency_key)
+            )
+            if existing is None:
+                raise
+            if existing.recipient_id != recipient_id or existing.input != input_text:
+                raise RelayError(
+                    "idempotency_conflict",
+                    "This Idempotency-Key was already used with a different task.",
+                    409,
+                )
+            return {"task_id": existing.id, "status": existing.status}
         return {"task_id": task.id, "status": task.status}
+
+
+def _get_task_for_update(db: Session, task_id: str, *, lock: bool = False) -> Task | None:
+    query = select(Task).where(Task.id == task_id)
+    if lock and USE_ROW_LOCKS:
+        query = query.with_for_update()
+    return db.scalar(query)
 
 
 def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
     with immediate_transaction() as db:
         now = utcnow()
         recover_expired_in_session(db, now)
-        task = db.scalar(
+        query = (
             select(Task)
             .where(Task.recipient_id == agent_id, Task.status == "queued")
             .order_by(Task.created_at, Task.id)
             .limit(1)
         )
+        if USE_ROW_LOCKS:
+            # skip_locked: another claim already holds the next queued row
+            # (e.g. a concurrent worker); move on rather than wait, so 16
+            # workers claiming at once each land on a different task instead
+            # of queueing behind one lock.
+            query = query.with_for_update(skip_locked=True)
+        task = db.scalar(query)
         if task is None:
             return None
         if task.attempt_count >= MAX_ATTEMPTS:
@@ -187,18 +228,22 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
         }
 
 
-def _find_attempt_for_token(db: Session, task_id: str, token: str) -> Attempt | None:
-    return db.scalar(
-        select(Attempt).where(Attempt.task_id == task_id, Attempt.claim_token_hash == secret_hash(token))
-    )
+def _find_attempt_for_token(db: Session, task_id: str, token: str, *, lock: bool = False) -> Attempt | None:
+    query = select(Attempt).where(Attempt.task_id == task_id, Attempt.claim_token_hash == secret_hash(token))
+    if lock and USE_ROW_LOCKS:
+        query = query.with_for_update()
+    return db.scalar(query)
 
 
 def heartbeat(task_id: str, agent_id: str, claim_token: str) -> str:
     with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+        # Lock Task before Attempt (matching recover_expired_in_session) so a
+        # heartbeat racing a recovery pass at lease expiry waits instead of
+        # deadlocking.
+        task = _get_task_for_update(db, task_id, lock=True)
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
-        attempt = _find_attempt_for_token(db, task_id, claim_token)
+        attempt = _find_attempt_for_token(db, task_id, claim_token, lock=True)
         now = utcnow()
         if (
             attempt is None
@@ -222,10 +267,10 @@ def commit_terminal(
     value: str,
 ) -> dict[str, str]:
     with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+        task = _get_task_for_update(db, task_id, lock=True)
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
-        attempt = _find_attempt_for_token(db, task_id, claim_token)
+        attempt = _find_attempt_for_token(db, task_id, claim_token, lock=True)
         if attempt is None:
             raise RelayError("stale_claim", "This claim is no longer active.", 409)
         value_digest = payload_hash(value)

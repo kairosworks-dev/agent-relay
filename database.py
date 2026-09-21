@@ -1,9 +1,10 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models (SQLite and PostgreSQL).
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+This module is intentionally the only place that knows about backend-specific
+connection details: SQLite pragmas and its writer-lock transaction, or the
+PostgreSQL engine pool sized for concurrent claims. ``USE_ROW_LOCKS`` tells
+:mod:`storage` which locking strategy is active; the models and the rest of
+the application are backend-agnostic.
 """
 
 from __future__ import annotations
@@ -134,6 +135,17 @@ def _is_sqlite(url: str) -> bool:
     return url.startswith("sqlite")
 
 
+def _is_postgres(url: str) -> bool:
+    return url.startswith("postgresql")
+
+
+# SQLite has no ``SELECT ... FOR UPDATE SKIP LOCKED``, so every writer is
+# serialized through one ``BEGIN IMMEDIATE`` transaction (see
+# ``immediate_transaction`` below). PostgreSQL supports real row locking, so
+# there the same call sites take row-level locks instead -- storage.py reads
+# this flag to decide whether to add ``.with_for_update(...)`` to a query.
+USE_ROW_LOCKS = _is_postgres(DATABASE_URL)
+
 engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
 if _is_sqlite(DATABASE_URL):
     engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
@@ -141,6 +153,10 @@ if _is_sqlite(DATABASE_URL):
         from sqlalchemy.pool import StaticPool
 
         engine_kwargs["poolclass"] = StaticPool
+elif _is_postgres(DATABASE_URL):
+    # The concurrent-claim test alone opens 16 simultaneous connections (one
+    # per worker thread); default pool_size=5/max_overflow=10 would starve it.
+    engine_kwargs.update({"pool_size": 20, "max_overflow": 20})
 
 engine: Engine = create_engine(DATABASE_URL, **engine_kwargs)
 
@@ -177,46 +193,93 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """One writer transaction boundary for claim/heartbeat/terminal/recovery.
 
     SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    ``BEGIN IMMEDIATE`` writer reservation serializes every writer (claims,
+    recovery, terminal submissions, even the ``last_seen_at`` stamp in
+    ``authenticate``) across API processes -- coarse, but it is the only tool
+    SQLite offers.
+
+    PostgreSQL supports real row-level locking, so here this is a plain
+    transaction; the actual concurrency safety comes from
+    ``.with_for_update(...)`` at each call site in storage.py (guarded by
+    ``USE_ROW_LOCKS``), which lets unrelated tasks proceed concurrently
+    instead of serializing every write in the database.
     """
 
-    connection = engine.connect()
-    session = Session(bind=connection, expire_on_commit=False, autoflush=True)
+    if _is_sqlite(DATABASE_URL):
+        connection = engine.connect()
+        session = Session(bind=connection, expire_on_commit=False, autoflush=True)
+        try:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            yield session
+            session.flush()
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            session.close()
+            connection.close()
+        return
+
+    session = SessionLocal()
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
         yield session
         session.flush()
-        connection.commit()
+        session.commit()
     except Exception:
-        connection.rollback()
+        session.rollback()
         raise
     finally:
         session.close()
-        connection.close()
 
 
 def recover_expired_in_session(db: Session, now: datetime) -> int:
-    """Expire active leases and requeue/fail their tasks within ``db``."""
+    """Expire active leases and requeue/fail their tasks within ``db``.
+
+    Two passes, deliberately: a lock-free scan finds candidate tasks, then
+    each is re-checked under its row lock before being mutated. A single
+    locked scan (``SELECT ... FOR UPDATE`` over the whole expired set) would
+    lock Attempt rows before Task rows; heartbeat/commit_terminal lock Task
+    then Attempt (see ``_get_task_for_update`` in storage.py). Two writers
+    taking the same pair of locks in opposite order is exactly how Postgres
+    deadlocks -- e.g. a heartbeat racing a recovery pass at the lease
+    boundary, which is SPEC.md scenario 4/6. Locking Task-then-Attempt here
+    too keeps the lock order consistent everywhere, so that race resolves by
+    ordinary waiting instead of a deadlock abort.
+    """
 
     now_db = as_db_time(now)
-    expired = list(
+    candidate_task_ids = list(
         db.scalars(
-            select(Attempt)
+            select(Attempt.task_id)
             .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
+            .distinct()
         )
     )
     count = 0
-    for attempt in expired:
-        task = db.get(Task, attempt.task_id)
-        if task is None or attempt.outcome != "processing":
+    for task_id in candidate_task_ids:
+        task_query = select(Task).where(Task.id == task_id)
+        if USE_ROW_LOCKS:
+            # skip_locked: a task currently locked by a live claim/heartbeat/
+            # terminal call isn't stale right now by definition -- skip it
+            # this pass rather than wait; RECOVERY_INTERVAL_SECONDS retries.
+            task_query = task_query.with_for_update(skip_locked=True)
+        task = db.scalar(task_query)
+        if task is None:
             continue
+        attempt_query = select(Attempt).where(
+            Attempt.task_id == task_id,
+            Attempt.outcome == "processing",
+            Attempt.lease_expires_at <= now_db,
+        )
+        if USE_ROW_LOCKS:
+            attempt_query = attempt_query.with_for_update()
+        attempt = db.scalar(attempt_query)
+        if attempt is None:
+            continue  # renewed by a heartbeat between the scan above and this lock
         attempt.outcome = "expired"
         attempt.finished_at = now_db
         if task.status == "processing":
@@ -251,6 +314,7 @@ __all__ = [
     "MAX_PAGE_SIZE",
     "RECOVERY_INTERVAL_SECONDS",
     "Task",
+    "USE_ROW_LOCKS",
     "as_db_time",
     "db_session",
     "db_time",

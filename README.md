@@ -67,13 +67,17 @@ uv run python main.py worker --agent-id agent_123 --token agt_… --worker-id la
 
 ## Storage and delivery behavior
 
-`database.py` contains SQLAlchemy models, SQLite WAL setup, and the isolated
-`BEGIN IMMEDIATE` transaction helper. `storage.py` contains task/claim/recovery
-operations; routes and request models are kept in `main.py` and `schemas.py`.
-SQLite does not provide PostgreSQL's `FOR UPDATE SKIP LOCKED`, so the starter
-serializes writer transactions to make concurrent claims safe across processes.
-Students can port this storage seam to PostgreSQL later without changing the
-HTTP protocol or lifecycle in `SPEC.md`.
+`database.py` contains SQLAlchemy models, SQLite WAL setup, and PostgreSQL
+support (`DATABASE_URL`/`RELAY_DATABASE_URL` starting `postgresql`).
+`storage.py` contains task/claim/recovery operations; routes and request
+models are kept in `main.py` and `schemas.py`. SQLite does not provide
+PostgreSQL's `FOR UPDATE SKIP LOCKED`, so on SQLite the app serializes every
+writer transaction with `BEGIN IMMEDIATE`. On PostgreSQL, `USE_ROW_LOCKS`
+switches `storage.py` to real row-level `.with_for_update()` locking on the
+specific Task/Attempt rows each operation touches, letting unrelated claims
+proceed concurrently — see `docker compose up --build` with `compose.yaml`
+for a ready-to-run PostgreSQL stack. The HTTP protocol and lifecycle in
+`SPEC.md` are unchanged either way.
 
 Claims are at-least-once and leased for 60 seconds by default. Heartbeats extend
 an active lease. A completion or failure must include the recipient's bearer
@@ -97,6 +101,7 @@ recreates all tables on whatever `RELAY_DATABASE_URL` points at, so stop
 the dev server first or set `RELAY_DATABASE_URL` to a scratch file before
 running tests against another database.
 
-This starter intentionally does not include Docker, Kubernetes, CI, external
-brokers, an LLM, or a PostgreSQL implementation. Those are deployment and
-student-port concerns rather than part of the local relay protocol.
+This starter intentionally does not include Kubernetes, CI, or external
+brokers/an LLM. Docker (`Dockerfile`, `.dockerignore`) and PostgreSQL
+(`compose.yaml`, the `USE_ROW_LOCKS` path in `database.py`/`storage.py`) are
+this fork's homework additions.
